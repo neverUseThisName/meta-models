@@ -1,6 +1,6 @@
 import math
 
-import torch
+import torch, tntorch
 from torch import Tensor
 import torch.nn as nn
 from torch.nn import functional as F, init
@@ -14,17 +14,17 @@ __all__ = [
 
 
 class Linear(nn.Module):
-    r"""Applies an meta affine linear transformation to the incoming data.
-
-    This module supports :ref:`TensorFloat32<tf32_on_ampere>`.
-
-    On certain ROCm devices, when using float16 inputs this module will use :ref:`different precision<fp16_on_mi200>` for backward.
+    r"""Meta linear moudule.
+    Uses tntorch library to compress the high dimensional meta weights.
 
     Args:
         in_features: size of each input sample
         out_features: size of each output sample
         bias: If set to ``False``, the layer will not learn an additive bias.
             Default: ``True``
+        order: The order of meta. Default: 1.
+        depth: number of iterations that input will go through this module.
+        kwargs: arguments passed to tntorch.Tensor constructor.
 
     Shape:
         - Input: :math:`(*, H_{in})` where :math:`*` means any number of
@@ -41,6 +41,8 @@ class Linear(nn.Module):
                 If :attr:`bias` is ``True``, the values are initialized from
                 :math:`\mathcal{U}(-\sqrt{k}, \sqrt{k})` where
                 :math:`k = \frac{1}{\text{in\_features}}`
+        order: The order of meta. Default: 1.
+        depth: number of iterations that input will go through this module.
 
     Examples::
 
@@ -62,43 +64,38 @@ class Linear(nn.Module):
         out_features: int,
         bias: bool = True,
         order: int = 1,
-        num_iters: int = 1,
+        depth: int = 1,
         device=None,
         dtype=None,
+        **kwargs
     ) -> None:
 
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.order = order
-        self.num_iters = num_iters
-        self.weight = Parameter(
-            torch.empty((out_features, in_features) + (in_features,) * order, **factory_kwargs)
-        )
+        self.order = order # meta param
+        self.depth = depth # meta param
+        self.weight = Parameter(tntorch.rand((out_features, in_features) + (in_features,) * order, **kwargs, **factory_kwargs))
         if bias:
-            self.bias = Parameter(torch.empty(out_features, **factory_kwargs))
+            self.bias = Parameter(torch.zeros(out_features, **factory_kwargs))
         else:
             self.register_parameter("bias", None)
-        self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        # Setting a=sqrt(5) in kaiming_uniform is the same as initializing with
-        # uniform(-1/sqrt(in_features), 1/sqrt(in_features)). For details, see
-        # https://github.com/pytorch/pytorch/issues/57109
-        init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        self.weight = Parameter(tntorch.rand((out_features, in_features) + (in_features,) * order, **kwargs, **factory_kwargs))
         if self.bias is not None:
-            fan_in, _ = init._calculate_fan_in_and_fan_out(self.weight)
-            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-            init.uniform_(self.bias, -bound, bound)
+            init.zeros_(self.bias)
 
     def forward(self, x: Tensor) -> Tensor:
-        for i in range(self.num_iters):
+        sqrt_d = math.sqrt(x.shape[-1])
+        for i in range(self.depth):
+            # first perform meta forward
             w = self.weights
             for j in range(self.order):
-                w = torch.matmul(w, x)
+                w = torch.matmul(x, w.T) / sqrt_d
             x = F.linear(x, w, self.bias)
         return x
 
     def extra_repr(self) -> str:
-        return f"in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}, order={self.order}, iters={self.num_iters}"
+        return f"in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}, order={self.order}, iters={self.depth}"
